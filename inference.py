@@ -199,7 +199,7 @@ def proc_folder(dict_args):
         device = "cpu"
     elif torch.cuda.is_available():
         print('CUDA is available, use --force_cpu to disable it.')
-        device = f'cuda:{args.device_ids[0]}' if isinstance(args.device_ids, list) else f'cuda:{args.device_ids}'
+        device = f'cuda:{args.device_ids[0]}'
     elif torch.backends.mps.is_available():
         device = "mps"
 

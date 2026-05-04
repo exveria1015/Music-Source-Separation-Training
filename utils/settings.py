@@ -7,12 +7,411 @@ import numpy as np
 import torch
 import argparse
 import socket
-from typing import Dict, List, Tuple, Union
-from omegaconf import OmegaConf
+import sys
+from typing import Any, Dict, List, Tuple, Union
+from omegaconf import ListConfig, OmegaConf
 from ml_collections import ConfigDict
 import torch.distributed as dist
 from torch import nn
 import soundfile as sf
+
+
+INTERNAL_LOSS_MODEL_TYPES = {
+    'bs_conformer',
+    'bs_mamba2',
+    'mel_band_conformer',
+}
+
+METRIC_ALIASES = {
+    'neg_log_wmse': 'log_wmse',
+}
+
+
+def parse_with_overrides(
+    parser: argparse.ArgumentParser,
+    overrides: Union[argparse.Namespace, Dict, None],
+) -> argparse.Namespace:
+    """Parse CLI arguments and apply programmatic overrides when provided."""
+    if overrides is None:
+        args = parser.parse_args()
+        provided = provided_arg_dests(parser, sys.argv[1:])
+        args._provided_args = sorted(provided)
+        return args
+
+    args = parser.parse_args([])
+    if isinstance(overrides, argparse.Namespace):
+        override_dict = vars(overrides)
+        provided = set(getattr(overrides, "_provided_args", override_dict.keys()))
+    else:
+        override_dict = dict(overrides)
+        provided = set(override_dict.keys())
+    args_dict = vars(args)
+    args_dict.update(override_dict)
+    parsed = argparse.Namespace(**args_dict)
+    parsed._provided_args = sorted(provided)
+    return parsed
+
+
+def provided_arg_dests(parser: argparse.ArgumentParser, argv: List[str]) -> set:
+    option_to_dest = {
+        option: action.dest
+        for action in parser._actions
+        for option in action.option_strings
+    }
+    provided = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("-"):
+            continue
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest:
+            provided.add(dest)
+    return provided
+
+
+def normalize_device_ids(device_ids) -> List[int]:
+    """Return device ids as a non-empty list of integers."""
+    if device_ids is None:
+        return [0]
+    if isinstance(device_ids, int):
+        return [device_ids]
+    if isinstance(device_ids, str):
+        parts = device_ids.replace(',', ' ').split()
+        if not parts:
+            raise ValueError("device_ids must not be empty")
+        return [int(part) for part in parts]
+
+    normalized = []
+    for item in device_ids:
+        if isinstance(item, str):
+            normalized.extend(int(part) for part in item.replace(',', ' ').split())
+        else:
+            normalized.append(int(item))
+
+    if not normalized:
+        raise ValueError("device_ids must not be empty")
+    return normalized
+
+
+def uses_internal_model_loss(model_type: str, use_standard_loss: bool = False) -> bool:
+    """Return whether a model computes its own training loss in forward()."""
+    if use_standard_loss:
+        return False
+    return model_type in INTERNAL_LOSS_MODEL_TYPES or 'roformer' in model_type
+
+
+def normalize_metric_name(metric_name: str) -> str:
+    return METRIC_ALIASES.get(metric_name, metric_name)
+
+
+def normalize_metric_names(metric_names: List[str]) -> List[str]:
+    if isinstance(metric_names, str):
+        metric_names = [metric_names]
+    normalized = []
+    for metric_name in metric_names:
+        metric_name = normalize_metric_name(metric_name)
+        if metric_name not in normalized:
+            normalized.append(metric_name)
+    return normalized
+
+
+def apply_legacy_lora_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Map legacy LoRA CLI names to the current explicit backend options."""
+    if getattr(args, 'train_lora', False):
+        args.train_lora_loralib = True
+    legacy_checkpoint = getattr(args, 'lora_checkpoint', '')
+    if legacy_checkpoint and not getattr(args, 'lora_checkpoint_loralib', ''):
+        args.lora_checkpoint_loralib = legacy_checkpoint
+    return args
+
+
+def apply_resume_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Enable all training-state load flags for an explicit resume."""
+    if getattr(args, 'resume', False):
+        args.load_optimizer = True
+        args.load_scheduler = True
+        args.load_scaler = True
+        args.load_ema = True
+        args.load_epoch = True
+        args.load_best_metric = True
+        args.load_all_metrics = True
+        args.load_all_losses = True
+    return args
+
+
+def arg_was_provided(args: argparse.Namespace, name: str) -> bool:
+    return name in set(getattr(args, "_provided_args", []))
+
+
+def config_arg_value(value: Any) -> Any:
+    if isinstance(value, ListConfig):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def set_arg_from_config_if_unset(
+    args: argparse.Namespace,
+    arg_name: str,
+    config: Union[ConfigDict, Dict],
+    path: str,
+) -> None:
+    if not hasattr(args, arg_name) or arg_was_provided(args, arg_name):
+        return
+    value = config_value(config, path, None)
+    if value is not None:
+        setattr(args, arg_name, config_arg_value(value))
+
+
+def apply_config_args(args: argparse.Namespace, config: Union[ConfigDict, Dict], mode: str) -> argparse.Namespace:
+    """Use config.training defaults for CLI args that were not explicitly supplied."""
+    common_mappings = [
+        ("valid_path", "training.valid_path"),
+        ("num_workers", "training.num_workers"),
+        ("pin_memory", "training.pin_memory"),
+        ("device_ids", "training.device_ids"),
+    ]
+    train_mappings = [
+        ("data_path", "training.data_path"),
+        ("dataset_type", "training.dataset_type"),
+        ("persistent_workers", "training.persistent_workers"),
+        ("prefetch_factor", "training.prefetch_factor"),
+    ]
+
+    for arg_name, path in common_mappings:
+        set_arg_from_config_if_unset(args, arg_name, config, path)
+    if mode == "train":
+        for arg_name, path in train_mappings:
+            set_arg_from_config_if_unset(args, arg_name, config, path)
+
+    if hasattr(args, "metrics") and not arg_was_provided(args, "metrics"):
+        metrics = config_value(config, "training.valid_metrics", None)
+        if metrics is None:
+            metrics = config_value(config, "training.metrics", None)
+        if metrics is not None:
+            args.metrics = config_arg_value(metrics)
+
+    if hasattr(args, "metric_for_scheduler") and not arg_was_provided(args, "metric_for_scheduler"):
+        metric_for_scheduler = config_value(config, "training.metric_for_scheduler", None)
+        if metric_for_scheduler is not None:
+            args.metric_for_scheduler = metric_for_scheduler
+
+    if hasattr(args, "device_ids"):
+        args.device_ids = normalize_device_ids(args.device_ids)
+    if hasattr(args, "metrics"):
+        args.metrics = normalize_metric_names(args.metrics)
+    if hasattr(args, "metric_for_scheduler"):
+        args.metric_for_scheduler = normalize_metric_name(args.metric_for_scheduler)
+        if args.metric_for_scheduler not in args.metrics:
+            args.metrics += [args.metric_for_scheduler]
+    if mode == "train" and hasattr(args, "use_standard_loss") and uses_internal_model_loss(
+        args.model_type,
+        args.use_standard_loss,
+    ):
+        args.loss = [f'{args.model_type}_loss']
+    return args
+
+
+def config_value(config: Union[ConfigDict, Dict], path: str, default: Any = None) -> Any:
+    current = config
+    for part in path.split('.'):
+        if isinstance(current, dict):
+            if part not in current:
+                return default
+            current = current[part]
+        else:
+            if not hasattr(current, part):
+                return default
+            current = getattr(current, part)
+    return current
+
+
+def set_config_default(config: Union[ConfigDict, Dict], path: str, value: Any) -> None:
+    parts = path.split('.')
+    current = config
+    for part in parts[:-1]:
+        current = current[part] if isinstance(current, dict) else getattr(current, part)
+    final_key = parts[-1]
+    if isinstance(current, dict):
+        current.setdefault(final_key, value)
+    elif not hasattr(current, final_key):
+        setattr(current, final_key, value)
+
+
+def schema_scheduler_name(config: Union[ConfigDict, Dict]) -> str:
+    return config_value(config, 'training.scheduler', 'ReduceLROnPlateau')
+
+
+def schema_dataset_type(config: Union[ConfigDict, Dict], context: Dict[str, Any]) -> int:
+    return int(context.get('dataset_type', 1))
+
+
+CONFIG_SCHEMAS = {
+    'common': [
+        {'path': 'training.instruments', 'types': (list, tuple, ListConfig), 'non_empty': True},
+        {'path': 'training.target_instrument', 'default': None, 'nullable': True},
+        {'path': 'inference.num_overlap', 'types': int, 'min': 1},
+        {'path': 'inference.batch_size', 'types': int, 'min': 1},
+    ],
+    'train': [
+        {'path': 'training.batch_size', 'types': int, 'min': 1},
+        {'path': 'training.num_epochs', 'types': int, 'min': 1},
+        {'path': 'training.num_steps', 'types': int, 'min': 1,
+         'when': lambda config, context: schema_dataset_type(config, context) != 5},
+        {'path': 'training.lr', 'types': (int, float), 'min_exclusive': 0},
+        {'path': 'training.optimizer', 'types': str,
+         'choices': ['adam', 'adamw', 'radam', 'rmsprop', 'prodigy', 'adamw8bit', 'muon', 'adago']},
+        {'path': 'training.patience', 'types': int, 'min': 0,
+         'when': lambda config, context: schema_scheduler_name(config) == 'ReduceLROnPlateau'},
+        {'path': 'training.reduce_factor', 'types': (int, float), 'min_exclusive': 0, 'max_exclusive': 1,
+         'when': lambda config, context: schema_scheduler_name(config) == 'ReduceLROnPlateau'},
+        {'path': 'training.num_warmup_steps', 'types': int, 'min': 0,
+         'when': lambda config, context: schema_scheduler_name(config) == 'linear_scheduler'},
+        {'path': 'training.ema_momentum', 'types': (int, float), 'min': 0, 'max_exclusive': 1,
+         'optional': True},
+        {'path': 'training.channels', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'training.file_types', 'types': (list, tuple, ListConfig), 'non_empty': True, 'optional': True},
+        {'path': 'training.max_load_attempts', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'training.strict_sample_rate', 'types': bool, 'optional': True},
+        {'path': 'training.class_balanced_stems', 'types': bool, 'optional': True},
+        {'path': 'training.max_class_presence_ratio', 'types': (int, float), 'min_exclusive': 0, 'max': 1,
+         'optional': True},
+        {'path': 'training.read_metadata_procs', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'training.precompute_workers', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'training.max_precompute_batches', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'training.precompute_batch_for_chunks', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'training.num_precompute_chunks', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'audio.chunk_size', 'types': int, 'min': 1},
+        {'path': 'audio.channels', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'audio.num_channels', 'types': int, 'min': 1, 'optional': True},
+        {'path': 'audio.min_mean_abs', 'types': (int, float), 'min': 0, 'default': 0.0},
+        {'path': 'augmentations.keep_original_mixture', 'types': bool, 'optional': True},
+    ],
+    'valid': [],
+}
+
+
+def validate_config_schema(config: Union[ConfigDict, Dict], schema_name: str, context: Dict[str, Any] = None) -> None:
+    context = context or {}
+    schema = CONFIG_SCHEMAS['common'] + CONFIG_SCHEMAS[schema_name]
+    errors = []
+
+    for field in schema:
+        should_validate = field.get('when', lambda cfg, ctx: True)(config, context)
+        if not should_validate:
+            continue
+
+        path = field['path']
+        has_default = 'default' in field
+        value = config_value(config, path, None)
+        if value is None:
+            if has_default:
+                set_config_default(config, path, field['default'])
+                value = field['default']
+            elif field.get('optional', False) or field.get('nullable', False):
+                continue
+            else:
+                errors.append(f"config.{path} is required")
+                continue
+
+        if value is None and field.get('nullable', False):
+            continue
+
+        expected_types = field.get('types')
+        if expected_types is not None:
+            if not isinstance(expected_types, tuple):
+                expected_types = (expected_types,)
+            if int in expected_types and isinstance(value, bool):
+                errors.append(f"config.{path} must be {expected_types}, got bool")
+                continue
+            if not isinstance(value, expected_types):
+                errors.append(f"config.{path} must be {expected_types}, got {type(value).__name__}")
+                continue
+
+        if field.get('non_empty') and len(value) == 0:
+            errors.append(f"config.{path} must not be empty")
+
+        if 'choices' in field and value not in field['choices']:
+            errors.append(f"config.{path} must be one of {field['choices']}, got {value!r}")
+
+        if 'min' in field and value < field['min']:
+            errors.append(f"config.{path} must be >= {field['min']}, got {value!r}")
+        if 'min_exclusive' in field and value <= field['min_exclusive']:
+            errors.append(f"config.{path} must be > {field['min_exclusive']}, got {value!r}")
+        if 'max' in field and value > field['max']:
+            errors.append(f"config.{path} must be <= {field['max']}, got {value!r}")
+        if 'max_exclusive' in field and value >= field['max_exclusive']:
+            errors.append(f"config.{path} must be < {field['max_exclusive']}, got {value!r}")
+
+    instruments = config_value(config, 'training.instruments')
+    target_instrument = config_value(config, 'training.target_instrument')
+    if instruments is not None and target_instrument is not None and target_instrument not in instruments:
+        errors.append(f"config.training.target_instrument={target_instrument!r} is not in instruments {instruments}")
+
+    scheduler_name = schema_scheduler_name(config)
+    if scheduler_name not in ['linear_scheduler', 'ReduceLROnPlateau']:
+        errors.append("config.training.scheduler must be one of ['linear_scheduler', 'ReduceLROnPlateau']")
+
+    if errors:
+        joined = "\n  - ".join(errors)
+        raise ValueError(f"Invalid {schema_name} config:\n  - {joined}")
+
+
+def validate_paths(paths, label: str) -> None:
+    if paths is None:
+        raise ValueError(f"{label} is required")
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    paths = list(paths)
+    if not paths:
+        raise ValueError(f"{label} must not be empty")
+    missing = [str(path) for path in paths if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(f"{label} contains missing paths: {missing}")
+
+
+def require_positive_number(config: Union[ConfigDict, Dict], path: str, *, integer: bool = False) -> None:
+    value = config_value(config, path)
+    if value is None:
+        raise ValueError(f"config.{path} is required")
+    if integer and int(value) != value:
+        raise ValueError(f"config.{path} must be an integer, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"config.{path} must be > 0, got {value!r}")
+
+
+def validate_common_config(config: Union[ConfigDict, Dict]) -> None:
+    validate_config_schema(config, 'valid')
+
+
+def validate_train_setup(config: Union[ConfigDict, Dict], args: argparse.Namespace, ddp: bool = False) -> None:
+    validate_config_schema(config, 'train', context={'dataset_type': args.dataset_type})
+    if not args.results_path:
+        raise ValueError("--results_path is required")
+    validate_paths(args.data_path, "--data_path")
+    validate_paths(args.valid_path, "--valid_path")
+    if args.dataset_type not in range(1, 8):
+        raise ValueError(f"--dataset_type must be in 1..7, got {args.dataset_type}")
+    if torch.cuda.is_available():
+        available_devices = torch.cuda.device_count()
+        invalid_device_ids = [device_id for device_id in args.device_ids if device_id < 0 or device_id >= available_devices]
+        if invalid_device_ids:
+            raise ValueError(f"Invalid CUDA device ids {invalid_device_ids}; available device count is {available_devices}.")
+    if ddp and len(args.device_ids) < 1:
+        raise ValueError("DDP training requires at least one device id")
+
+
+def validate_valid_setup(config: Union[ConfigDict, Dict], args: argparse.Namespace) -> None:
+    validate_config_schema(config, 'valid')
+    validate_paths(args.valid_path, "--valid_path")
+    if torch.cuda.is_available():
+        available_devices = torch.cuda.device_count()
+        invalid_device_ids = [device_id for device_id in args.device_ids if device_id < 0 or device_id >= available_devices]
+        if invalid_device_ids:
+            raise ValueError(f"Invalid CUDA device ids {invalid_device_ids}; available device count is {available_devices}.")
 
 
 def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argparse.Namespace:
@@ -36,10 +435,16 @@ def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argpar
                         help="One of mdx23c, htdemucs, segm_models, mel_band_roformer, bs_roformer, swin_upernet, bandit")
     parser.add_argument("--config_path", type=str, help="path to config file")
     parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint to start training")
+    parser.add_argument("--resume", action='store_true',
+                        help="Resume full training state from --start_check_point")
     parser.add_argument("--load_optimizer", action='store_true',
                         help="Load optimizer state from checkpoint (if available)")
     parser.add_argument("--load_scheduler", action='store_true',
                         help="Load scheduler state from checkpoint (if available)")
+    parser.add_argument("--load_scaler", action='store_true',
+                        help="Load AMP GradScaler state from checkpoint (if available)")
+    parser.add_argument("--load_ema", action='store_true',
+                        help="Load EMA state from checkpoint (if available)")
     parser.add_argument("--load_epoch", action='store_true', help="Load epoch number from checkpoint (if available)")
     parser.add_argument("--load_best_metric", action='store_true',
                         help="Load best metric from checkpoint (if available)")
@@ -80,15 +485,17 @@ def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argpar
     parser.add_argument("--wandb_offline", action='store_true', help='local wandb')
     parser.add_argument("--pre_valid", action='store_true', help='Run validation before training')
     parser.add_argument("--metrics", nargs='+', type=str, default=["sdr"],
-                        choices=['k_sdr', 'sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
+                        choices=['k_sdr', 'sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'neg_log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
                                  'fullness', 'l1_snr'], help='List of metrics to use.')
     parser.add_argument("--metric_for_scheduler", default="sdr",
-                        choices=['k_sdr','sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
+                        choices=['k_sdr', 'sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'neg_log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
                                  'fullness', 'l1_snr'], help='Metric which will be used for scheduler.')
     parser.add_argument("--train_lora_peft", action='store_true', help="Training with LoRA from peft")
     parser.add_argument("--train_lora_loralib", action='store_true', help="Training with LoRA from loralib")
+    parser.add_argument("--train_lora", action='store_true', help=argparse.SUPPRESS)
     parser.add_argument("--lora_checkpoint_peft", type=str, default='', help="Initial checkpoint to LoRA weights")
     parser.add_argument("--lora_checkpoint_loralib", type=str, default='', help="Initial checkpoint to LoRA weights")
+    parser.add_argument("--lora_checkpoint", type=str, default='', help=argparse.SUPPRESS)
     parser.add_argument("--each_metrics_in_name", action='store_true',
                         help="All stems in naming checkpoints")
     parser.add_argument("--use_standard_loss", action='store_true',
@@ -107,20 +514,17 @@ def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argpar
                         help="List of layers to freeze. Use prefixes e.g. layer1 - will freeze all layers whose names "
                              "starts with layer1. You can set mulitple parameters.")
 
-    if dict_args is not None:
-        args = parser.parse_args([])
-        args_dict = vars(args)
-        args_dict.update(dict_args)
-        args = argparse.Namespace(**args_dict)
-    else:
-        args = parser.parse_args()
+    args = parse_with_overrides(parser, dict_args)
+    args.device_ids = normalize_device_ids(args.device_ids)
+    args = apply_resume_args(args)
+    args = apply_legacy_lora_args(args)
+    args.metrics = normalize_metric_names(args.metrics)
+    args.metric_for_scheduler = normalize_metric_name(args.metric_for_scheduler)
 
     if args.metric_for_scheduler not in args.metrics:
         args.metrics += [args.metric_for_scheduler]
 
-    get_internal_loss = (args.model_type in ('mel_band_conformer',) or 'roformer' in args.model_type
-                         ) and not args.use_standard_loss
-    if get_internal_loss:
+    if uses_internal_model_loss(args.model_type, args.use_standard_loss):
         args.loss = [f'{args.model_type}_loss']
     return args
 
@@ -162,19 +566,16 @@ def parse_args_valid(dict_args: Union[Dict, None]) -> argparse.Namespace:
                         help="Flag adds test time augmentation during inference (polarity and channel inverse)."
                              "While this triples the runtime, it reduces noise and slightly improves prediction quality.")
     parser.add_argument("--metrics", nargs='+', type=str, default=["sdr"],
-                        choices=['k_sdr', 'sdr', 'l1_freq', 'si_sdr', 'neg_log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
+                        choices=['k_sdr', 'sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'neg_log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
                                  'fullness', 'l1_snr'], help='List of metrics to use.')
     parser.add_argument("--lora_checkpoint_peft", type=str, default='', help="Initial checkpoint to LoRA weights")
     parser.add_argument("--lora_checkpoint_loralib", type=str, default='', help="Initial checkpoint to LoRA weights")
+    parser.add_argument("--lora_checkpoint", type=str, default='', help=argparse.SUPPRESS)
 
-
-    if dict_args is not None:
-        args = parser.parse_args([])
-        args_dict = vars(args)
-        args_dict.update(dict_args)
-        args = argparse.Namespace(**args_dict)
-    else:
-        args = parser.parse_args()
+    args = parse_with_overrides(parser, dict_args)
+    args.device_ids = normalize_device_ids(args.device_ids)
+    args = apply_legacy_lora_args(args)
+    args.metrics = normalize_metric_names(args.metrics)
 
     return args
 
@@ -207,7 +608,7 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
     parser.add_argument("--draw_spectro", type=float, default=0,
                         help="Code will generate spectrograms for resulted stems."
                              " Value defines for how many seconds os track spectrogram will be generated.")
-    parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
+    parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='list of gpu ids')
     parser.add_argument("--extract_instrumental", action='store_true',
                         help="invert vocals to get instrumental if provided")
     parser.add_argument("--disable_detailed_pbar", action='store_true', help="disable detailed progress bar")
@@ -221,16 +622,13 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
     parser.add_argument("--bigshifts", type=int, default=1,
                         help="Number of circular time shifts to average during demix. Values <= 0 are treated as 1.")
     parser.add_argument("--lora_checkpoint_peft", type=str, default='', help="Initial checkpoint to LoRA weights")
+    parser.add_argument("--lora_checkpoint", type=str, default='', help=argparse.SUPPRESS)
     parser.add_argument("--filename_template", type=str, default='{file_name}/{instr}',
                         help="Output filename template, without extension, using '/' for subdirectories. Default: '{file_name}/{instr}'")
     parser.add_argument("--lora_checkpoint_loralib", type=str, default='', help="Initial checkpoint to LoRA weights")
-    if dict_args is not None:
-        args = parser.parse_args([])
-        args_dict = vars(args)
-        args_dict.update(dict_args)
-        args = argparse.Namespace(**args_dict)
-    else:
-        args = parser.parse_args()
+    args = parse_with_overrides(parser, dict_args)
+    args.device_ids = normalize_device_ids(args.device_ids)
+    args = apply_legacy_lora_args(args)
     args.pcm_type = validate_sndfile_subtype(args)
 
     return args
@@ -373,9 +771,6 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple[nn.Module,
             win_length=getattr(config.stft, 'win_length', config.stft.n_fft),
             center=config.stft.center
         )
-    elif model_type == 'mel_band_conformer':
-        from models.mel_band_conformer import MelBandConformer
-        model = MelBandConformer(**config.model)
     elif model_type == 'moises_light':
         from moises_light import MoisesLight
         model = MoisesLight(**dict(config.model))
@@ -452,6 +847,7 @@ def write_results_in_file(store_dir: str, logs: List[str]) -> None:
         None
     """
     if not dist.is_initialized() or dist.get_rank() == 0:
+        os.makedirs(store_dir, exist_ok=True)
         with open(f'{store_dir}/results.txt', 'w') as out:
             for item in logs:
                 out.write(item + "\n")
@@ -498,6 +894,9 @@ def initialize_environment(seed: int, results_path: str) -> None:
         None
     """
 
+    if not results_path:
+        raise ValueError("--results_path is required")
+
     manual_seed(seed)
     torch.backends.cudnn.deterministic = False
     try:
@@ -507,7 +906,14 @@ def initialize_environment(seed: int, results_path: str) -> None:
     os.makedirs(results_path, exist_ok=True)
 
 
-def initialize_environment_ddp(rank: int, world_size: int, seed: int = 0, resuls_path: str = None) -> None:
+def initialize_environment_ddp(
+    rank: int,
+    world_size: int,
+    seed: int = 0,
+    resuls_path: str = None,
+    device_id: int = None,
+    master_port: int = None,
+) -> None:
     """
     Initialize environment for Distributed Data Parallel (DDP) training/validation.
 
@@ -521,12 +927,14 @@ def initialize_environment_ddp(rank: int, world_size: int, seed: int = 0, resuls
         seed (int, optional): Random seed for reproducibility. Defaults to 0.
         resuls_path (str, optional): Directory path to create for storing results.
             If None, no directory is created. Defaults to None.
+        device_id (int, optional): CUDA device id assigned to this rank.
+        master_port (int, optional): Shared DDP rendezvous port. If omitted,
+            uses MASTER_PORT from the environment or a deterministic seed-based port.
 
     Returns:
         None
     """
-    seed = (seed + int(time.time())) % 55535 + 10000
-    setup_ddp(rank, world_size, seed)
+    setup_ddp(rank, world_size, seed, device_id=device_id, master_port=master_port)
     manual_seed(seed)
 
     try:
@@ -602,7 +1010,13 @@ def find_free_port():
         return s.getsockname()[1]
 
 
-def setup_ddp(rank: int, world_size: int, seed: int) -> None:
+def setup_ddp(
+    rank: int,
+    world_size: int,
+    seed: int,
+    device_id: int = None,
+    master_port: int = None,
+) -> None:
     """
     Initialize a Distributed Data Parallel (DDP) process group.
 
@@ -614,22 +1028,41 @@ def setup_ddp(rank: int, world_size: int, seed: int) -> None:
     Args:
         rank (int): Rank of the current process in the DDP group.
         world_size (int): Total number of processes participating in DDP.
-        seed:
+        seed: Random seed used for deterministic fallback port selection.
+        device_id (int, optional): CUDA device id assigned to this rank.
+        master_port (int, optional): Explicit rendezvous port shared by all ranks.
     Returns:
         None
     """
 
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(seed)
-    os.environ["USE_LIBUV"] = "0"
-    try:
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    except:
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        if dist.get_rank() == 0:
-            print(f'NCCL are not available. Using "gloo" backend.')
+    if master_port is None:
+        master_port = os.environ.get('MASTER_PORT')
+    if master_port is None:
+        master_port = 10000 + (int(seed) % 50000)
 
-    torch.cuda.set_device(rank)
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_PORT'] = str(master_port)
+    os.environ["USE_LIBUV"] = "0"
+
+    if device_id is None:
+        device_id = rank
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device_id)
+
+    if torch.cuda.is_available():
+        try:
+            dist.init_process_group("nccl", rank=rank, world_size=world_size)
+            return
+        except Exception as e:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            if rank == 0:
+                print(f'NCCL is not available ({e}). Using "gloo" backend.')
+
+    if not dist.is_initialized():
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        if rank == 0 and not torch.cuda.is_available():
+            print('CUDA is not available. Using "gloo" backend.')
 
 
 def cleanup_ddp() -> None:
@@ -642,4 +1075,5 @@ def cleanup_ddp() -> None:
     Returns:
         None
     """
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()

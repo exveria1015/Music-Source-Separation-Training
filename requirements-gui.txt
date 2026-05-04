@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Optional dependency for gui/gui-wx.py.
+# On Linux, wxPython may build from source and require GTK3 development headers.
+wxpython>=4.2.5,<4.3

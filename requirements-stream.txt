@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Optional dependencies for scripts/stream.py.
+# On Linux, PyAudio may build from source and require PortAudio development headers.
+pyaudio>=0.2.14,<0.3
+keyboard>=0.13.5,<0.14

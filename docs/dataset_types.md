@@ -88,6 +88,11 @@ Key properties:
 - `mixture.wav` is loaded explicitly if present
 - If `mixture.wav` is missing, mixture is computed as sum of stems
 - Supports precomputed random chunks (same logic as Type 4)
+- When stem-changing augmentations are enabled, the default behavior is to
+  rebuild the mixture from augmented stems so targets and input stay aligned
+- Set `augmentations.keep_original_mixture: true` when `mixture.wav` must remain
+  the exact training input. In that mode, stem-changing augmentations and
+  loudness changes are skipped for Type 6.
 
 Typical use cases:
 - Teacher–student or distillation training

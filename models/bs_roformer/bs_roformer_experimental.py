@@ -642,19 +642,18 @@ class BSRoformer(Module):
 
         recon_audio = rearrange(recon_audio, '(b n s) t -> b n s t', s=self.audio_channels, n=num_stems)
 
-        if num_stems == 1:
-            recon_audio = rearrange(recon_audio, 'b 1 s t -> b s t')
-
-        # if a target is passed in, calculate loss for learning
-
         if not exists(target):
+            if num_stems == 1:
+                return rearrange(recon_audio, 'b 1 s t -> b s t')
             return recon_audio
 
         if self.num_stems > 1:
             assert target.ndim == 4 and target.shape[1] == self.num_stems
 
         if target.ndim == 2:
-            target = rearrange(target, '... t -> ... 1 t')
+            target = rearrange(target, 'b t -> b 1 1 t')
+        elif target.ndim == 3:
+            target = rearrange(target, 'b s t -> b 1 s t')
 
         target = target[..., :recon_audio.shape[-1]]  # protect against lost length on istft
 

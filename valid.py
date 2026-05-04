@@ -2,11 +2,14 @@
 __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 
 import argparse
+import copy
+import hashlib
 import math
 import time
 import os
 import gc
 import glob
+import traceback
 import torch
 import librosa
 import numpy as np
@@ -16,7 +19,7 @@ from ml_collections import ConfigDict
 from typing import Tuple, Dict, List, Union, Any, Optional
 import torch.distributed as dist
 from pathlib import Path
-from utils.settings import get_model_from_config, logging, write_results_in_file, parse_args_valid
+from utils.settings import get_model_from_config, logging, normalize_device_ids, write_results_in_file, parse_args_valid, validate_valid_setup, apply_config_args
 from utils.audio_utils import normalize_audio, denormalize_audio, read_audio_transposed, \
     draw_2_mel_spectrogram
 from utils.model_utils import demix, prefer_target_instrument, apply_tta, load_start_checkpoint
@@ -25,6 +28,62 @@ from utils.metrics import get_metrics
 import warnings
 
 warnings.filterwarnings("ignore")
+
+
+def is_main_process() -> bool:
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def unwrap_parallel_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def distributed_tensor_device(preferred_device: torch.device) -> torch.device:
+    if dist.is_initialized() and dist.get_backend() == "gloo":
+        return torch.device("cpu")
+    return preferred_device
+
+
+def is_cuda_oom(error: BaseException) -> bool:
+    message = str(error).lower()
+    return isinstance(error, RuntimeError) and ("out of memory" in message or "cuda oom" in message)
+
+
+def output_base_path(store_dir: str, folder: str, instr: str) -> str:
+    folder_path = Path(folder).resolve()
+    digest = hashlib.sha1(str(folder_path).encode("utf-8")).hexdigest()[:8]
+    safe_name = folder_path.name.replace(os.sep, "_")
+    return str(Path(store_dir) / f"{safe_name}_{digest}_{instr}")
+
+
+def demix_with_oom_retry(
+    config: ConfigDict,
+    model: torch.nn.Module,
+    mix: np.ndarray,
+    device: torch.device,
+    model_type: str,
+) -> Dict[str, np.ndarray]:
+    try:
+        return demix(config, model, mix, device, model_type=model_type)
+    except RuntimeError as error:
+        if not is_cuda_oom(error):
+            raise
+        if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+            raise
+
+        current_batch_size = int(getattr(config.inference, "batch_size", 1))
+        if current_batch_size <= 1:
+            raise
+
+        torch.cuda.empty_cache()
+        retry_config = copy.deepcopy(config)
+        retry_config.inference.batch_size = max(1, current_batch_size // 2)
+        if is_main_process():
+            print(
+                f"CUDA OOM during validation demix; retry with inference.batch_size="
+                f"{retry_config.inference.batch_size}"
+            )
+        return demix(retry_config, model, mix, device, model_type=model_type)
 
 
 def get_mixture_paths(
@@ -53,8 +112,7 @@ def get_mixture_paths(
         List[str]: Sorted list of discovered mixture file paths.
     """
 
-    ddp_mode = dist.is_initialized()
-    should_print = (not ddp_mode) or (dist.get_rank() == 0)
+    should_print = is_main_process()
 
     # --- read & normalize args.valid_path ---
     try:
@@ -64,16 +122,16 @@ def get_mixture_paths(
             print("No valid path in args")
         raise e
 
-    if isinstance(valid_path, str):
+    if isinstance(valid_path, (str, os.PathLike)):
         valid_paths: List[str] = [valid_path]
     else:
         valid_paths = list(valid_path)
 
     # --- collect mixture files ---
     all_mixtures_path: List[str] = []
+    extension = extension.lstrip(".")
 
     def find_mixture_files(root_dir):
-        from pathlib import Path
         root_path = Path(root_dir)
         wav_files = list(root_path.rglob("mixture.wav"))
         flac_files = list(root_path.rglob("mixture.flac"))
@@ -87,7 +145,11 @@ def get_mixture_paths(
         part = find_mixture_files(root)
         if not part and verbose and should_print:
             print(f"No validation data found in: {root}")
-        all_mixtures_path.extend(part)
+        all_mixtures_path.extend(str(path) for path in part)
+    all_mixtures_path = sorted(dict.fromkeys(all_mixtures_path))
+
+    if not all_mixtures_path:
+        raise RuntimeError(f"No validation mixtures found in: {[str(path) for path in valid_paths]}")
 
     # --- verbose summary ---
     if verbose and should_print:
@@ -153,7 +215,7 @@ def update_metrics_and_pbar(
     """
 
     ddp_mode = dist.is_initialized()
-    should_print = (not ddp_mode) or (dist.get_rank() == 0)
+    should_print = is_main_process()
 
     if ddp_mode and path is None:
         raise ValueError("`path` must be provided when torch.distributed is initialized.")
@@ -223,7 +285,7 @@ def process_audio_files(
     """
 
     ddp_mode = dist.is_initialized()
-    should_print = (not ddp_mode) or (dist.get_rank() == 0)
+    should_print = is_main_process()
 
     instruments = prefer_target_instrument(config)
     use_tta = getattr(args, 'use_tta', False)
@@ -275,6 +337,8 @@ def process_audio_files(
         mix_orig = mix.copy()
         folder = os.path.dirname(path)
         real_instruments = get_instruments(folder)
+        if not real_instruments and verbose and should_print:
+            print(f"No reference stems found for validation track: {folder}")
         # resample input to config SR if needed
         if 'audio' in config and 'sample_rate' in config.audio:
             target_sr = config.audio['sample_rate']
@@ -293,28 +357,42 @@ def process_audio_files(
         else:
             norm_params = None
 
-        waveforms_orig = demix(config, model, mix.copy(), device, model_type=args.model_type)
+        waveforms_orig = demix_with_oom_retry(config, model, mix.copy(), device, model_type=args.model_type)
 
         if use_tta:
             waveforms_orig = apply_tta(config, model, mix, waveforms_orig, device, args.model_type)
 
         pbar_dict = {}
 
-        for instr, extension in real_instruments.items():
+        for instr, track_extension in real_instruments.items():
             if verbose and should_print:
                 print(f"Instr: {instr}")
 
             # read GT track
             if instr != 'other' or not getattr(config.training, 'other_fix', False):
-                track, sr1 = read_audio_transposed(f"{folder}/{instr}.{extension}", instr, skip_err=True)
+                track, sr1 = read_audio_transposed(f"{folder}/{instr}.{track_extension}", instr, skip_err=True)
                 if track is None:
                     continue
             else:
                 # other = mix - vocals
-                track, sr1 = read_audio_transposed(f"{folder}/vocals.{extension}")
+                vocals_extension = real_instruments.get('vocals', track_extension)
+                track, sr1 = read_audio_transposed(f"{folder}/vocals.{vocals_extension}")
                 track = mix_orig - track
 
-            estimates = waveforms_orig[instr]
+            if isinstance(waveforms_orig, dict):
+                if instr not in waveforms_orig:
+                    if verbose and should_print:
+                        print(f"Model did not return instrument '{instr}' for {folder}; skip metric.")
+                    continue
+                estimates = waveforms_orig[instr]
+            else:
+                instrument_order = prefer_target_instrument(config)
+                if instr not in instrument_order:
+                    if verbose and should_print:
+                        print(f"Model output has no instrument '{instr}' for {folder}; skip metric.")
+                    continue
+                estimate_index = instrument_order.index(instr)
+                estimates = waveforms_orig[estimate_index]
 
             # back-resample estimates to original SR if input was resampled
             if 'audio' in config and 'sample_rate' in config.audio:
@@ -330,7 +408,7 @@ def process_audio_files(
             # --- saving (uniform rule) ---
             if store_dir:
                 os.makedirs(store_dir, exist_ok=True)
-                base = f"{store_dir}/{os.path.basename(folder)}_{instr}"
+                base = output_base_path(store_dir, folder, instr)
                 peak = float(np.abs(estimates).max())
                 if peak <= 1.0:
                     out_path = f"{base}.flac"
@@ -389,7 +467,8 @@ def compute_metric_avg(
     instruments: List[str],
     config: ConfigDict,
     all_metrics: Dict[str, Dict[str, Union[List[float], Dict[str, float]]]],
-    start_time: float
+    start_time: float,
+    track_count: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Compute average metrics across instruments (DDP-aware) and optionally log to file.
@@ -415,8 +494,7 @@ def compute_metric_avg(
         Dict[str, float]: Mapping from metric name to its average over instruments.
     """
 
-    ddp_mode = dist.is_initialized()
-    should_print = (not ddp_mode) or (dist.get_rank() == 0)
+    should_print = is_main_process()
 
     logs: List[str] = []
     verbose_logging = bool(store_dir) and should_print
@@ -424,8 +502,11 @@ def compute_metric_avg(
         logs.append(str(args))
 
     logs = logging(logs, text=f"Num overlap: {config.inference.num_overlap}", verbose_logging=verbose_logging)
+    if track_count is not None:
+        logs = logging(logs, text=f"Validation tracks: {track_count}", verbose_logging=verbose_logging)
 
     metric_sum: Dict[str, float] = {}
+    metric_count: Dict[str, int] = {}
 
     for instr in instruments:
         for metric_name in all_metrics:
@@ -438,25 +519,33 @@ def compute_metric_avg(
                 vals = list(values_obj)
 
             arr = np.asarray(vals, dtype=float)
-            if arr.size == 0:
+            finite_arr = arr[np.isfinite(arr)]
+            if finite_arr.size == 0:
                 mean_val = float("nan")
                 std_val = float("nan")
             else:
-                mean_val = float(arr.mean())
-                std_val = float(arr.std())
+                mean_val = float(finite_arr.mean())
+                std_val = float(finite_arr.std())
 
             logs = logging(
                 logs,
-                text=f"Instr {instr} {metric_name}: {mean_val:.4f} (Std: {std_val:.4f})",
+                text=f"Instr {instr} {metric_name}: {mean_val:.4f} (Std: {std_val:.4f}, Count: {finite_arr.size})",
                 verbose_logging=verbose_logging
             )
-
-            metric_sum[metric_name] = metric_sum.get(metric_name, 0.0) + mean_val
+            if track_count is not None and finite_arr.size < track_count:
+                logs = logging(
+                    logs,
+                    text=f"Missing/invalid {metric_name} samples for {instr}: {track_count - finite_arr.size}",
+                    verbose_logging=verbose_logging
+                )
+            if np.isfinite(mean_val):
+                metric_sum[metric_name] = metric_sum.get(metric_name, 0.0) + mean_val
+                metric_count[metric_name] = metric_count.get(metric_name, 0) + 1
 
     metric_avg: Dict[str, float] = {}
-    denom = max(len(instruments), 1)
     for metric_name in all_metrics:
-        metric_avg[metric_name] = metric_sum.get(metric_name, float("nan")) / denom
+        count = metric_count.get(metric_name, 0)
+        metric_avg[metric_name] = metric_sum[metric_name] / count if count else float("nan")
 
     if len(instruments) > 1:
         for metric_name, avg in metric_avg.items():
@@ -503,6 +592,7 @@ def valid(
     """
 
     start_time = time.time()
+    model = unwrap_parallel_model(model)
     model.eval().to(device)
 
     # dir to save files, if empty no saving
@@ -517,7 +607,7 @@ def valid(
     all_metrics = process_audio_files(all_mixtures_path, model, args, config, device, verbose, not verbose)
     instruments = prefer_target_instrument(config)
 
-    return compute_metric_avg(store_dir, args, instruments, config, all_metrics, start_time), all_metrics
+    return compute_metric_avg(store_dir, args, instruments, config, all_metrics, start_time, len(all_mixtures_path)), all_metrics
 
 
 def validate_in_subprocess(
@@ -559,33 +649,38 @@ def validate_in_subprocess(
         The function modifies the `return_dict` in place, but does not return any value.
     """
 
-    m1 = model.eval().to(device)
-    if proc_id == 0:
-        progress_bar = tqdm(total=len(all_mixtures_path))
-
-    # Initialize metrics dictionary
-    all_metrics = {
-        metric: {instr: [] for instr in config.training.instruments}
-        for metric in args.metrics
-    }
-
-    while True:
-        current_step, path = queue.get()
-        if path is None:  # check for sentinel value
-            break
-        single_metrics = process_audio_files([path], m1, args, config, device, False, False)
-        pbar_dict = {}
-        for instr in config.training.instruments:
-            for metric_name in all_metrics:
-                all_metrics[metric_name][instr] += single_metrics[metric_name][instr]
-                if len(single_metrics[metric_name][instr]) > 0:
-                    pbar_dict[f"{metric_name}_{instr}"] = f"{single_metrics[metric_name][instr][0]:.4f}"
+    progress_bar = None
+    try:
+        m1 = unwrap_parallel_model(model).eval().to(device)
         if proc_id == 0:
-            progress_bar.update(current_step - progress_bar.n)
-            progress_bar.set_postfix(pbar_dict)
-        # print(f"Inference on process {proc_id}", all_sdr)
-    return_dict[proc_id] = all_metrics
-    return
+            progress_bar = tqdm(total=len(all_mixtures_path))
+
+        all_metrics = {
+            metric: {instr: [] for instr in config.training.instruments}
+            for metric in args.metrics
+        }
+
+        while True:
+            _, path = queue.get()
+            if path is None:
+                break
+            single_metrics = process_audio_files([path], m1, args, config, device, False, False)
+            pbar_dict = {}
+            for instr in config.training.instruments:
+                for metric_name in all_metrics:
+                    all_metrics[metric_name][instr] += single_metrics[metric_name][instr]
+                    if len(single_metrics[metric_name][instr]) > 0:
+                        pbar_dict[f"{metric_name}_{instr}"] = f"{single_metrics[metric_name][instr][0]:.4f}"
+            if progress_bar is not None:
+                progress_bar.update(1)
+                progress_bar.set_postfix(pbar_dict)
+        return_dict[proc_id] = all_metrics
+    except Exception:
+        return_dict[proc_id] = {"__error__": traceback.format_exc()}
+        raise
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
 
 
 def run_parallel_validation(
@@ -621,12 +716,8 @@ def run_parallel_validation(
         A shared dictionary containing the validation metrics from all processes.
     """
 
-    model = model.to('cpu')
-    try:
-        # For multiGPU training extract single model
-        model = model.module
-    except:
-        pass
+    device_ids = normalize_device_ids(device_ids)
+    model = unwrap_parallel_model(model).to('cpu')
 
     queue = torch.multiprocessing.Queue()
     processes = []
@@ -647,7 +738,20 @@ def run_parallel_validation(
     for _ in range(len(device_ids)):
         queue.put((None, None))  # sentinel value to signal subprocesses to exit
     for p in processes:
-        p.join()  # wait for all subprocesses to finish
+        p.join()
+
+    errors = []
+    for i, p in enumerate(processes):
+        worker_result = return_dict.get(i)
+        if isinstance(worker_result, dict) and "__error__" in worker_result:
+            errors.append(f"worker {i}:\n{worker_result['__error__']}")
+        elif p.exitcode != 0:
+            errors.append(f"worker {i} exited with code {p.exitcode}")
+        elif i not in return_dict:
+            errors.append(f"worker {i} exited without returning metrics")
+
+    if errors:
+        raise RuntimeError("Parallel validation failed:\n" + "\n".join(errors))
 
     return
 
@@ -731,6 +835,9 @@ def valid_multi_gpu(
     """
 
     start_time = time.time()
+    if device_ids is None:
+        device_ids = getattr(args, "device_ids", [0])
+    device_ids = normalize_device_ids(device_ids)
 
     inference = getattr(config, "inference", None)
     if inference is None and isinstance(config, dict):
@@ -750,7 +857,12 @@ def valid_multi_gpu(
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
-        device = torch.device(f"cuda:{rank}")
+        if torch.cuda.is_available():
+            device_id = device_ids[rank] if rank < len(device_ids) else torch.cuda.current_device()
+            device = torch.device(f"cuda:{device_id}")
+        else:
+            device = torch.device("cpu")
+        model = unwrap_parallel_model(model)
         model.to(device)
         model.eval()
 
@@ -786,12 +898,13 @@ def valid_multi_gpu(
                 else:
                     local_data = list(per_instr)
 
+                gather_device = distributed_tensor_device(device)
                 if len(local_data) == 0:
-                    local_tensor = torch.zeros(target_len, dtype=torch.float32, device=device)
+                    local_tensor = torch.full((target_len,), float("nan"), dtype=torch.float32, device=gather_device)
                 else:
                     if len(local_data) < target_len:
-                        local_data = local_data + [0.0] * (target_len - len(local_data))
-                    local_tensor = torch.tensor(local_data, dtype=torch.float32, device=device)
+                        local_data = local_data + [float("nan")] * (target_len - len(local_data))
+                    local_tensor = torch.tensor(local_data, dtype=torch.float32, device=gather_device)
 
                 gathered_list = [torch.zeros_like(local_tensor) for _ in range(world_size)]
                 dist.all_gather(gathered_list, local_tensor)
@@ -807,7 +920,8 @@ def valid_multi_gpu(
                 instruments,
                 config,
                 all_metrics,
-                start_time
+                start_time,
+                num_tracks
             )
             return metric_avg, all_metrics
 
@@ -815,6 +929,13 @@ def valid_multi_gpu(
 
     # Not DDP
     store_dir = getattr(args, "store_dir", "")
+
+    if len(device_ids) <= 1:
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{device_ids[0]}")
+        else:
+            device = torch.device("cpu")
+        return valid(model, args, config, device, verbose=verbose)
 
     return_dict = torch.multiprocessing.Manager().dict()
     run_parallel_validation(verbose, all_mixtures_path, config, model, device_ids, args, return_dict)
@@ -828,7 +949,7 @@ def valid_multi_gpu(
             all_metrics[metric][instr] = merged
 
     instruments = prefer_target_instrument(config)
-    metric_avg = compute_metric_avg(store_dir, args, instruments, config, all_metrics, start_time)
+    metric_avg = compute_metric_avg(store_dir, args, instruments, config, all_metrics, start_time, len(all_mixtures_path))
     return metric_avg, all_metrics
 
 
@@ -842,6 +963,8 @@ def check_validation(dict_args):
     model, config = get_model_from_config(args.model_type, args.config_path)
     if 'model_type' in config.training:
         args.model_type = config.training.model_type
+    args = apply_config_args(args, config, mode='valid')
+    validate_valid_setup(config, args)
     if args.start_check_point:
         checkpoint = torch.load(args.start_check_point, weights_only=False, map_location='cpu')
         load_start_checkpoint(args, model, checkpoint, type_='valid')

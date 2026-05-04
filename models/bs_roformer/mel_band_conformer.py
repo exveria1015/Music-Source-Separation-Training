@@ -692,14 +692,16 @@ class MelBandConformer(Module):
         )
 
         recon_audio = rearrange(recon_audio, '(b n s) t -> b n s t', b=batch, s=self.audio_channels, n=num_stems)
-        if num_stems == 1:
-            recon_audio = rearrange(recon_audio, 'b 1 s t -> b s t')
 
         if not exists(target):
+            if num_stems == 1:
+                return rearrange(recon_audio, 'b 1 s t -> b s t')
             return recon_audio
 
         if target.ndim == 2:
-            target = rearrange(target, '... t -> ... 1 t')
+            target = rearrange(target, 'b t -> b 1 1 t')
+        elif target.ndim == 3:
+            target = rearrange(target, 'b s t -> b 1 s t')
 
         target = target[..., :recon_audio.shape[-1]]
         target_sel = target[:, stem_ids]

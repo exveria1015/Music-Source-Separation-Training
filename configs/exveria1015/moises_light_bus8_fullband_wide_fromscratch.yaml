@@ -1,0 +1,240 @@
+# Moises-Light 8-stem full-scratch config.
+# Fullband-wide preset: processes 3072 STFT bins at 44.1 kHz, i.e. all
+# practical bandwidth except the single Nyquist bin from n_fft=6144.
+
+audio:
+  chunk_size: 396900  # 44100 * 9 seconds
+  num_channels: 2
+  sample_rate: 44100
+  # Keep this at zero for sparse 8-stem data. A positive value would require
+  # every stem to be active in an aligned chunk and can over-reject bus8 tracks.
+  min_mean_abs: 0.000
+
+model:
+  sources:
+    - bass
+    - drums
+    - other
+    - lead_vocals
+    - backing_vocals
+    - guitar
+    - piano
+    - synth
+  audio_channels: 2
+  n_fft: 6144
+  hop_size: 1024
+  win_size: 6144
+  freq_dim: 3072
+  n_bands: 6
+  G: 84
+  n_enc: 3
+  n_dec: 1
+  n_split_enc: 3
+  n_split_dec: 1
+  n_rope: 5
+  bn_factor: 8
+  normalized: true
+  use_mask: true
+  transformer_params:
+    heads: 4
+    dim_head: 32
+    ff_mult: 2
+    attn_dropout: 0.0
+    proj_dropout: 0.0
+    ff_dropout: 0.0
+    flash_attn: true
+
+training:
+  model_type: moises_light
+  dataset_type: 4
+  data_path:
+    - /home/synome/exveria1015/shares/datas/moisedb_bus8_full/train
+  valid_path:
+    - /home/synome/exveria1015/shares/datas/moisedb_bus8_full/valid
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  grad_clip: 1.0
+  valid_metrics:
+    - sdr
+    - si_sdr
+    - bleedless
+    - fullness
+  metric_for_scheduler: si_sdr
+  use_active_stem_avg_for_scheduler: true
+  class_balanced_stems: true
+  valid_log_to_file: true
+  valid_console_summary_only: true
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  audio_file_cache_size: 64
+  device_prefetch: false
+  log_every_steps: 20
+  enable_mix_reconstruction_validation: true
+  mix_reconstruction_valid_path: ../wavs
+  mix_reconstruction_extensions:
+    - wav
+    - flac
+  mix_reconstruction_stems:
+    - bass
+    - drums
+    - other
+    - lead_vocals
+    - backing_vocals
+    - guitar
+    - piano
+    - synth
+  mix_reconstruction_metric_name: sum_vs_mix_sdr
+  instruments:
+    - bass
+    - drums
+    - other
+    - lead_vocals
+    - backing_vocals
+    - guitar
+    - piano
+    - synth
+  lr: 3.0e-04
+  patience: 4
+  reduce_factor: 0.85
+  target_instrument: null
+  num_epochs: 1000
+  num_steps: 1000
+  q: 0.95
+  coarse_loss_clip: true
+  ema_momentum: 0.999
+  optimizer: adamw
+  scheduler: ReduceLROnPlateau
+  other_fix: false
+  use_amp: false
+
+optimizer:
+  weight_decay: 0.01
+
+loss_multistft:
+  fft_sizes:
+    - 4096
+    - 2048
+    - 1024
+    - 512
+    - 256
+  hop_sizes:
+    - 1024
+    - 512
+    - 256
+    - 128
+    - 64
+  win_lengths:
+    - 4096
+    - 2048
+    - 1024
+    - 512
+    - 256
+
+augmentations:
+  enable: true
+  loudness: true
+  loudness_min: 0.5
+  loudness_max: 1.5
+  mixup: true
+  mixup_probs: !!python/tuple
+    - 0.2
+    - 0.02
+  mixup_loudness_min: 0.5
+  mixup_loudness_max: 1.5
+
+  all:
+    channel_shuffle: 0.5
+    random_inverse: 0.1
+    random_polarity: 0.5
+
+  lead_vocals:
+    pitch_shift: 0.1
+    pitch_shift_min_semitones: -5
+    pitch_shift_max_semitones: 5
+    seven_band_parametric_eq: 0.1
+    seven_band_parametric_eq_min_gain_db: -9
+    seven_band_parametric_eq_max_gain_db: 9
+    tanh_distortion: 0.1
+    tanh_distortion_min: 0.1
+    tanh_distortion_max: 0.7
+
+  backing_vocals:
+    pitch_shift: 0.1
+    pitch_shift_min_semitones: -5
+    pitch_shift_max_semitones: 5
+    seven_band_parametric_eq: 0.1
+    seven_band_parametric_eq_min_gain_db: -9
+    seven_band_parametric_eq_max_gain_db: 9
+    tanh_distortion: 0.1
+    tanh_distortion_min: 0.1
+    tanh_distortion_max: 0.7
+
+  bass:
+    pitch_shift: 0.1
+    pitch_shift_min_semitones: -2
+    pitch_shift_max_semitones: 2
+    seven_band_parametric_eq: 0.1
+    seven_band_parametric_eq_min_gain_db: -3
+    seven_band_parametric_eq_max_gain_db: 6
+    tanh_distortion: 0.1
+    tanh_distortion_min: 0.1
+    tanh_distortion_max: 0.5
+
+  drums:
+    pitch_shift: 0.1
+    pitch_shift_min_semitones: -5
+    pitch_shift_max_semitones: 5
+    seven_band_parametric_eq: 0.1
+    seven_band_parametric_eq_min_gain_db: -9
+    seven_band_parametric_eq_max_gain_db: 9
+    tanh_distortion: 0.1
+    tanh_distortion_min: 0.1
+    tanh_distortion_max: 0.6
+
+  other:
+    pitch_shift: 0.1
+    pitch_shift_min_semitones: -4
+    pitch_shift_max_semitones: 4
+    gaussian_noise: 0.1
+    gaussian_noise_min_amplitude: 0.001
+    gaussian_noise_max_amplitude: 0.015
+    time_stretch: 0.1
+    time_stretch_min_rate: 0.8
+    time_stretch_max_rate: 1.25
+
+  guitar:
+    pitch_shift: 0.08
+    pitch_shift_min_semitones: -4
+    pitch_shift_max_semitones: 4
+    seven_band_parametric_eq: 0.08
+    seven_band_parametric_eq_min_gain_db: -6
+    seven_band_parametric_eq_max_gain_db: 6
+    tanh_distortion: 0.05
+    tanh_distortion_min: 0.05
+    tanh_distortion_max: 0.4
+
+  piano:
+    pitch_shift: 0.05
+    pitch_shift_min_semitones: -2
+    pitch_shift_max_semitones: 2
+    seven_band_parametric_eq: 0.08
+    seven_band_parametric_eq_min_gain_db: -6
+    seven_band_parametric_eq_max_gain_db: 6
+
+  synth:
+    pitch_shift: 0.1
+    pitch_shift_min_semitones: -5
+    pitch_shift_max_semitones: 5
+    seven_band_parametric_eq: 0.1
+    seven_band_parametric_eq_min_gain_db: -9
+    seven_band_parametric_eq_max_gain_db: 9
+    gaussian_noise: 0.1
+    gaussian_noise_min_amplitude: 0.001
+    gaussian_noise_max_amplitude: 0.015
+
+inference:
+  batch_size: 1
+  num_overlap: 4
+  normalize: false

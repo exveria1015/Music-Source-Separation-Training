@@ -4,11 +4,16 @@ __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 import argparse
 import json
 import os
+import platform
+import shutil
+import sys
+import tempfile
 from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
 from ml_collections import ConfigDict
+from omegaconf import OmegaConf
 from torch.optim import Adam, AdamW, SGD, RAdam, RMSprop
 from tqdm.auto import tqdm
 from typing import Dict, List, Tuple, Any, Union, Optional
@@ -135,8 +140,10 @@ def demix(
     batch_size = config.inference.batch_size
 
     use_amp = getattr(config.training, 'use_amp', True)
+    device_type = torch.device(device).type
+    amp_enabled = use_amp and device_type == 'cuda'
 
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.amp.autocast(device_type=device_type, enabled=amp_enabled):
         with torch.inference_mode():
             # Initialize result and counter tensors
             req_shape = (num_instruments,) + mix.shape
@@ -798,17 +805,107 @@ def log_model_info(model: torch.nn.Module, results_path=None):
         print(f"Number of layers: {len(layer_info)}")
 
 
+def to_jsonable(value: Any) -> Any:
+    if isinstance(value, argparse.Namespace):
+        return {key: to_jsonable(val) for key, val in vars(value).items()}
+    if OmegaConf.is_config(value):
+        return to_jsonable(OmegaConf.to_container(value, resolve=True))
+    if hasattr(value, "to_dict"):
+        try:
+            return to_jsonable(value.to_dict())
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def runtime_metadata(args, config, device_ids: List[int]) -> Dict[str, Any]:
+    return {
+        "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "numpy": np.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+        "device_ids": list(device_ids),
+        "args": to_jsonable(args),
+        "config": to_jsonable(config),
+    }
+
+
+def unwrap_parallel_model(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, 'module') else model
+
+
+def checkpoint_model_for_source(model: nn.Module, model_state_source: str, ema_model: Optional[nn.Module] = None) -> nn.Module:
+    if model_state_source == 'ema':
+        return unwrap_parallel_model(ema_model if ema_model is not None else model)
+    if model_state_source == 'model':
+        return unwrap_parallel_model(model)
+    raise ValueError("model_state_source must be 'model' or 'ema'")
+
+
+def atomic_torch_save(obj: Any, path: str) -> None:
+    target_path = os.path.abspath(path)
+    target_dir = os.path.dirname(target_path) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=target_dir)
+    os.close(fd)
+    try:
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, target_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def atomic_save_pretrained(model: nn.Module, path: str) -> None:
+    target_path = os.path.abspath(path)
+    target_dir = os.path.dirname(target_path) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    tmp_path = f"{target_path}.tmp-{os.getpid()}"
+    if os.path.exists(tmp_path):
+        shutil.rmtree(tmp_path)
+    try:
+        model.save_pretrained(tmp_path)
+        if os.path.isdir(target_path):
+            shutil.rmtree(target_path)
+        elif os.path.exists(target_path):
+            os.remove(target_path)
+        os.replace(tmp_path, target_path)
+    finally:
+        if os.path.exists(tmp_path):
+            shutil.rmtree(tmp_path)
+
+
 def save_weights(
         store_path: str,
         model: nn.Module,
         device_ids: List[int],
-        optimizer: torch.optim.Optimizer,
+        optimizer: Optional[torch.optim.Optimizer],
         epoch: int,
         all_time_all_metrics,
         all_losses,
         best_metric: float,
         args,
-        scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau] = None
+        scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau] = None,
+        config: Optional[ConfigDict] = None,
+        ema_model: Optional[nn.Module] = None,
+        scaler: Optional[Any] = None,
+        checkpoint_type: str = 'training',
+        model_state_source: str = 'model',
+        include_training_state: bool = True,
 ) -> None:
     """
     Save a training checkpoint containing model weights, optimizer/scheduler states, and metadata.
@@ -835,33 +932,37 @@ def save_weights(
         None
     """
 
+    model_to_save = checkpoint_model_for_source(model, model_state_source, ema_model)
     checkpoint: Dict[str, Any] = {
+        "checkpoint_format_version": 2,
+        "checkpoint_type": checkpoint_type,
+        "model_state_source": model_state_source,
         "epoch": epoch,
-        "optimizer_name": optimizer.__class__.__name__,
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "best_metric": best_metric,
         "all_metrics": all_time_all_metrics,
-        "all_losses": all_losses
+        "all_losses": all_losses,
+        "metadata": runtime_metadata(args, config, device_ids),
     }
+
+    if include_training_state:
+        checkpoint["optimizer_name"] = optimizer.__class__.__name__ if optimizer else None
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict() if optimizer else None
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict() if scheduler else None
+        checkpoint["scaler_state_dict"] = scaler.state_dict() if scaler is not None else None
+        checkpoint["ema_state_dict"] = ema_model.state_dict() if ema_model is not None else None
 
     # Save model weights
     if args.train_lora_peft:
-        model.save_pretrained(store_path + '_lora_')
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            atomic_save_pretrained(model_to_save, store_path + '_lora_')
     elif args.train_lora_loralib:
-        checkpoint["model_state_dict"] = lora.lora_state_dict(model)
+        checkpoint["model_state_dict"] = lora.lora_state_dict(model_to_save)
     else:
-        if dist.is_initialized():
-            # In DDP, use .module
-            checkpoint["model_state_dict"] = model.module.state_dict()
-        else:
-            checkpoint["model_state_dict"] = (
-                model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
-            )
+        checkpoint["model_state_dict"] = model_to_save.state_dict()
 
     # Save only on rank 0 (or if not using DDP)
     if not dist.is_initialized() or dist.get_rank() == 0:
-        torch.save(checkpoint, store_path)
+        atomic_torch_save(checkpoint, store_path)
 
 
 def save_last_weights(
@@ -874,6 +975,9 @@ def save_last_weights(
         all_losses,
         best_metric: float,
         scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau] = None,
+        config: Optional[ConfigDict] = None,
+        ema_model: Optional[nn.Module] = None,
+        scaler: Optional[Any] = None,
 ) -> None:
     """
     Save the latest training checkpoint for continuation or recovery.
@@ -910,5 +1014,41 @@ def save_last_weights(
         all_losses=all_losses,
         best_metric=best_metric,
         args=args,
-        scheduler=scheduler
+        scheduler=scheduler,
+        config=config,
+        ema_model=ema_model,
+        scaler=scaler,
+        checkpoint_type='training',
+        model_state_source='model',
+        include_training_state=True,
+    )
+
+
+def save_eval_weights(
+        store_path: str,
+        model: nn.Module,
+        device_ids: List[int],
+        epoch: int,
+        all_time_all_metrics,
+        all_losses,
+        best_metric: float,
+        args,
+        config: Optional[ConfigDict] = None,
+        model_state_source: str = 'model',
+) -> None:
+    save_weights(
+        store_path=store_path,
+        model=model,
+        device_ids=device_ids,
+        optimizer=None,
+        epoch=epoch,
+        all_time_all_metrics=all_time_all_metrics,
+        all_losses=all_losses,
+        best_metric=best_metric,
+        args=args,
+        scheduler=None,
+        config=config,
+        checkpoint_type='eval',
+        model_state_source=model_state_source,
+        include_training_state=False,
     )

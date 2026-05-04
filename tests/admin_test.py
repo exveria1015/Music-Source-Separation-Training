@@ -3,6 +3,7 @@ from scripts.redact_config import redact_config
 from utils.settings import load_config
 from pathlib import Path
 import os
+import shutil
 import numpy as np
 import soundfile as sf
 from typing import List, Dict
@@ -98,6 +99,7 @@ def cleanup_test_tracks() -> None:
     None
         This function does not return a value. It performs cleanup of test data.
     """
+    shutil.rmtree(TEST_DIR, ignore_errors=True)
 
 
 def modify_configs() -> Dict[str, Path]:

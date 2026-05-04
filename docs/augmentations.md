@@ -10,6 +10,9 @@ augmentations:
   loudness: true # randomly change loudness of each stem on the range (loudness_min; loudness_max)
   loudness_min: 0.5
   loudness_max: 1.5
+  # For dataset types that load mixture.wav explicitly, keep the original
+  # mixture and skip stem-changing augmentations/loudness.
+  keep_original_mixture: false
   mixup: true # mix several stems of same type with some probability (only works for dataset types: 1, 2, 3)
   mixup_probs: !!python/tuple # 2 additional stems of the same type (1st with prob 0.2, 2nd with prob 0.02)
     - 0.2
